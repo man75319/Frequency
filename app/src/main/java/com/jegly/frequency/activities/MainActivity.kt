@@ -3,6 +3,7 @@ package com.jegly.frequency.activities
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
@@ -56,6 +57,19 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var viewModel: MainViewModel
 
+    companion object {
+        /**
+         * Permission guarding the music library. READ_MEDIA_AUDIO only exists from API 33; on
+         * older releases the system does not recognise it at all — requesting it there returns
+         * silently without a dialog, leaving the app stuck on the permission screen.
+         */
+        private val AUDIO_PERMISSION: String =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+                Manifest.permission.READ_MEDIA_AUDIO
+            else
+                Manifest.permission.READ_EXTERNAL_STORAGE
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         val splashScreen = installSplashScreen()
         super.onCreate(savedInstanceState)
@@ -85,7 +99,7 @@ class MainActivity : AppCompatActivity() {
 
             var hasPermission by remember {
                 mutableStateOf(
-                    ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_AUDIO)
+                    ContextCompat.checkSelfPermission(context, AUDIO_PERMISSION)
                             == PackageManager.PERMISSION_GRANTED
                 )
             }
@@ -101,7 +115,7 @@ class MainActivity : AppCompatActivity() {
 
             LaunchedEffect(Unit) {
                 if (!hasPermission) {
-                    launcher.launch(arrayOf(Manifest.permission.READ_MEDIA_AUDIO))
+                    launcher.launch(arrayOf(AUDIO_PERMISSION))
                 }
                 // Handle intent that launched the activity (e.g. opening a music file)
                 handleIncomingIntent(intent)
@@ -118,7 +132,7 @@ class MainActivity : AppCompatActivity() {
             ) {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     when {
-                        !hasPermission -> PermissionDeniedScreen { launcher.launch(arrayOf(Manifest.permission.READ_MEDIA_AUDIO)) }
+                        !hasPermission -> PermissionDeniedScreen { launcher.launch(arrayOf(AUDIO_PERMISSION)) }
                         !isAuthenticated -> BiometricAuthScreen { isAuthenticated = true }
                         else -> MainContainer(viewModel)
                     }
