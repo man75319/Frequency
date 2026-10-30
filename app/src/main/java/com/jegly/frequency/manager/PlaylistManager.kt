@@ -30,34 +30,32 @@ class PlaylistManager private constructor() {
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
     
-    private var nextPlaylistId: Long = 3 // Start after system playlists (0, 1, 2)
-    
+    private var nextPlaylistId: Long = PlaylistStorageManager.FIRST_USER_PLAYLIST_ID
+
     suspend fun loadPlaylists(context: Context) = withContext(Dispatchers.IO) {
         _isLoading.value = true
         try {
-            val titles = PlaylistStorageManager.getPlaylistTitles(context)
+            val stored = PlaylistStorageManager.getPlaylists(context)
             val playlistModels = mutableListOf<PlaylistModel>()
-            
+
             // Add system playlists
             playlistModels.add(PlaylistModel(id = 0, name = "Playing Queue", isSystemPlaylist = true))
             playlistModels.add(PlaylistModel(id = 1, name = "Favorite", isSystemPlaylist = true))
             playlistModels.add(PlaylistModel(id = -1, name = "Recently Played", isSystemPlaylist = true))
-            
-            // Add custom playlists
-            titles.forEachIndexed { index, title ->
-                if (index >= 2) { // Skip system playlists
-                    val id = index.toLong()
-                    playlistModels.add(PlaylistModel(
-                        id = id,
-                        name = title,
-                        isSystemPlaylist = false,
-                        category = AppSettings.getPlaylistCategory(context, id)
-                    ))
-                }
+
+            // Add custom playlists, each keeping the id it was saved with
+            stored.forEach { entry ->
+                playlistModels.add(PlaylistModel(
+                    id = entry.id,
+                    name = entry.name,
+                    isSystemPlaylist = false,
+                    category = AppSettings.getPlaylistCategory(context, entry.id)
+                ))
             }
 
             _playlists.value = playlistModels
-            nextPlaylistId = (playlistModels.maxOfOrNull { it.id } ?: 2) + 1
+            nextPlaylistId = (stored.maxOfOrNull { it.id }
+                ?: (PlaylistStorageManager.FIRST_USER_PLAYLIST_ID - 1)) + 1
         } finally {
             _isLoading.value = false
         }
@@ -74,15 +72,13 @@ class PlaylistManager private constructor() {
         currentPlaylists.add(newPlaylist)
         _playlists.value = currentPlaylists
         
-        // Update storage
-        val titles = currentPlaylists.filter { !it.isSystemPlaylist }.map { it.name }
-        PlaylistStorageManager.savePlaylistTitles(context, titles)
+        persist(context, currentPlaylists)
         
         newPlaylist.id
     }
     
     suspend fun renamePlaylist(context: Context, playlistId: Long, newName: String) = withContext(Dispatchers.IO) {
-        if (playlistId < 2) return@withContext // Cannot rename system playlists
+        if (isSystemPlaylistId(playlistId)) return@withContext // Cannot rename system playlists
         
         val currentPlaylists = _playlists.value.toMutableList()
         val playlistIndex = currentPlaylists.indexOfFirst { it.id == playlistId }
@@ -90,14 +86,12 @@ class PlaylistManager private constructor() {
             currentPlaylists[playlistIndex] = currentPlaylists[playlistIndex].copy(name = newName)
             _playlists.value = currentPlaylists
             
-            // Update storage
-            val titles = currentPlaylists.filter { !it.isSystemPlaylist }.map { it.name }
-            PlaylistStorageManager.savePlaylistTitles(context, titles)
+            persist(context, currentPlaylists)
         }
     }
     
     suspend fun deletePlaylist(context: Context, playlistId: Long) = withContext(Dispatchers.IO) {
-        if (playlistId < 2) return@withContext // Cannot delete system playlists
+        if (isSystemPlaylistId(playlistId)) return@withContext // Cannot delete system playlists
         
         val currentPlaylists = _playlists.value.toMutableList()
         val playlistIndex = currentPlaylists.indexOfFirst { it.id == playlistId }
@@ -105,12 +99,11 @@ class PlaylistManager private constructor() {
             currentPlaylists.removeAt(playlistIndex)
             _playlists.value = currentPlaylists
             
-            // Update storage
-            val titles = currentPlaylists.filter { !it.isSystemPlaylist }.map { it.name }
-            PlaylistStorageManager.savePlaylistTitles(context, titles)
+            persist(context, currentPlaylists)
             
             // Remove playlist tracks
-            PlaylistStorageManager.dropPlaylistCardDataAt(context, playlistId.toInt())
+            PlaylistStorageManager.dropPlaylistTracks(context, playlistId)
+            AppSettings.setPlaylistCategory(context, playlistId, null)
         }
     }
     
@@ -133,12 +126,22 @@ class PlaylistManager private constructor() {
             -1L -> PlaylistStorageManager.getRecentTracks(context)
             0L -> emptyList()
             1L -> PlaylistStorageManager.getFavorite(context)
-            else -> PlaylistStorageManager.getPlaylistTrackAtPosition(context, playlistId.toInt())
+            else -> PlaylistStorageManager.getPlaylistTracks(context, playlistId)
         }
     }
 
+    /** Playing Queue (0), Favorite (1) and Recently Played (-1) are built in and not editable. */
+    private fun isSystemPlaylistId(id: Long): Boolean =
+        id < PlaylistStorageManager.FIRST_USER_PLAYLIST_ID
+
+    /** Writes the current user playlists (ids included) to disk. */    private suspend fun persist(context: Context, all: List<PlaylistModel>) {
+        val stored = all.filter { !it.isSystemPlaylist }
+            .map { PlaylistStorageManager.StoredPlaylist(it.id, it.name) }
+        PlaylistStorageManager.savePlaylists(context, stored)
+    }
+
     suspend fun reorderPlaylistTracks(context: Context, playlistId: Long, from: Int, to: Int) = withContext(Dispatchers.IO) {
-        if (playlistId < 2) return@withContext
+        if (isSystemPlaylistId(playlistId)) return@withContext
         val tracks = getPlaylistTracks(context, playlistId).toMutableList()
         if (from !in tracks.indices || to !in tracks.indices) return@withContext
         val item = tracks.removeAt(from)
@@ -163,7 +166,7 @@ class PlaylistManager private constructor() {
         if (playlistId == 1L) {
             PlaylistStorageManager.saveFavorite(context, tracks)
         } else {
-            PlaylistStorageManager.updatePlaylistTracks(context, tracks, playlistId.toInt())
+            PlaylistStorageManager.updatePlaylistTracks(context, tracks, playlistId)
         }
     }
 }

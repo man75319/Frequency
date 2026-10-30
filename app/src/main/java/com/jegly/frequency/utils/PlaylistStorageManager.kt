@@ -13,6 +13,12 @@ import java.io.*
 
 object PlaylistStorageManager {
 
+    /** A user playlist as stored on disk: an explicit, stable id plus its name. */
+    data class StoredPlaylist(val id: Long, val name: String)
+
+    /** Ids 0, 1 and -1 belong to the built-in playlists, so user playlists start at 2. */
+    const val FIRST_USER_PLAYLIST_ID = 2L
+
     private const val TAG = "PlaylistStorageManager"
     private const val FOLDER_HISTORY = "history"
     private const val PLAYLIST_DATA_FILE = "Playlist_Tracks_Data.json"
@@ -82,66 +88,72 @@ object PlaylistStorageManager {
         loadTrackList(context, IMPORTED_TRACKS_FILE)
     }
 
-    suspend fun savePlaylistTitles(context: Context, titles: List<String>) = withContext(Dispatchers.IO) {
+    /**
+     * Persists user playlists as `[{"id":2,"name":"..."}, ...]`. The id is stored explicitly
+     * rather than derived from the array position: positions shift when a playlist in the middle
+     * is deleted, which used to desynchronise a playlist from its track list.
+     */
+    suspend fun savePlaylists(context: Context, playlists: List<StoredPlaylist>) = withContext(Dispatchers.IO) {
         val arr = JSONArray()
-        for (t in titles) arr.put(t)
+        for (p in playlists) {
+            try {
+                arr.put(JSONObject().put("id", p.id).put("name", p.name))
+            } catch (e: JSONException) {
+                Log.e(TAG, "savePlaylists serialise error", e)
+            }
+        }
         val f = File(context.filesDir, PLAYLIST_TITLES_FILE)
         try {
             writeJson(f, arr.toString())
         } catch (e: IOException) {
-            Log.e(TAG, "savePlaylistTitles failed", e)
+            Log.e(TAG, "savePlaylists failed", e)
         }
     }
 
-    suspend fun getPlaylistTitles(context: Context): List<String> = withContext(Dispatchers.IO) {
-        val list = mutableListOf<String>()
+    /** Reads the user playlists. Returns an empty list when nothing has been saved yet. */
+    suspend fun getPlaylists(context: Context): List<StoredPlaylist> = withContext(Dispatchers.IO) {
         val f = File(context.filesDir, PLAYLIST_TITLES_FILE)
-        if (!f.exists()) {
-            return@withContext listOf(
-                context.getString(R.string.playlist_current_queue),
-                context.getString(R.string.favorite_playlist)
-            )
-        }
+        if (!f.exists()) return@withContext emptyList()
+        val list = mutableListOf<StoredPlaylist>()
         try {
-            val json = readFile(f)
-            if (json != null) {
-                val arr = JSONArray(json)
-                for (i in 0 until arr.length()) list.add(arr.getString(i))
+            val json = readFile(f) ?: return@withContext emptyList()
+            val arr = JSONArray(json)
+            for (i in 0 until arr.length()) {
+                when (val entry = arr.get(i)) {
+                    // Current format: {"id":…,"name":…}
+                    is JSONObject -> {
+                        val name = entry.optString("name", "")
+                        if (name.isNotEmpty()) list.add(StoredPlaylist(entry.getLong("id"), name))
+                    }
+                    // Legacy format: a bare array of names, positionally indexed from 0.
+                    is String -> if (entry.isNotEmpty()) {
+                        list.add(StoredPlaylist(FIRST_USER_PLAYLIST_ID + i, entry))
+                    }
+                }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "getPlaylistTitles failed", e)
+            Log.e(TAG, "getPlaylists failed", e)
         }
-        if (list.isEmpty()) {
-            listOf(
-                context.getString(R.string.playlist_current_queue),
-                context.getString(R.string.favorite_playlist)
-            )
-        } else list
+        list
     }
 
-    suspend fun updatePlaylistTracks(context: Context, updatedList: List<MusicModel>?, index: Int) = withContext(Dispatchers.IO) {
+    suspend fun updatePlaylistTracks(context: Context, updatedList: List<MusicModel>?, playlistId: Long) = withContext(Dispatchers.IO) {
         synchronized(PLAYLIST_DATA_FILE) {
-            val all = loadAllPlaylistTracks(context).toMutableList()
-            while (all.size <= index) all.add(mutableListOf())
-            all[index] = updatedList?.toMutableList() ?: mutableListOf()
+            val all = loadAllPlaylistTracks(context).toMutableMap()
+            if (updatedList.isNullOrEmpty()) all.remove(playlistId)
+            else all[playlistId] = updatedList.toList()
             saveAllPlaylistTracks(context, all)
         }
     }
 
-    suspend fun getPlaylistTrackAtPosition(context: Context, pos: Int): List<MusicModel> = withContext(Dispatchers.IO) {
-        val all = loadAllPlaylistTracks(context)
-        if (pos in all.indices) all[pos].toList() else emptyList()
+    suspend fun getPlaylistTracks(context: Context, playlistId: Long): List<MusicModel> = withContext(Dispatchers.IO) {
+        loadAllPlaylistTracks(context)[playlistId] ?: emptyList()
     }
 
-    suspend fun dropPlaylistCardDataAt(context: Context, pos: Int) = withContext(Dispatchers.IO) {
+    suspend fun dropPlaylistTracks(context: Context, playlistId: Long) = withContext(Dispatchers.IO) {
         synchronized(PLAYLIST_DATA_FILE) {
-            val customIndex = pos - 2
-            if (customIndex < 0) return@synchronized
-            val all = loadAllPlaylistTracks(context).toMutableList()
-            if (customIndex in all.indices) {
-                all.removeAt(customIndex)
-                saveAllPlaylistTracks(context, all)
-            }
+            val all = loadAllPlaylistTracks(context).toMutableMap()
+            if (all.remove(playlistId) != null) saveAllPlaylistTracks(context, all)
         }
     }
 
@@ -191,10 +203,10 @@ object PlaylistStorageManager {
         return list
     }
 
-    private fun saveAllPlaylistTracks(context: Context, listOfLists: List<List<MusicModel>>) {
+    private fun saveAllPlaylistTracks(context: Context, tracksById: Map<Long, List<MusicModel>>) {
         val f = File(context.filesDir, PLAYLIST_DATA_FILE)
-        val outer = JSONArray()
-        for (inner in listOfLists) {
+        val outer = JSONObject()
+        for ((id, inner) in tracksById) {
             val arr = JSONArray()
             for (m in inner) {
                 try {
@@ -203,7 +215,7 @@ object PlaylistStorageManager {
                     Log.e(TAG, "saveAllPlaylistTracks serialise error", e)
                 }
             }
-            outer.put(arr)
+            outer.put(id.toString(), arr)
         }
         try {
             writeJson(f, outer.toString())
@@ -212,25 +224,44 @@ object PlaylistStorageManager {
         }
     }
 
-    private fun loadAllPlaylistTracks(context: Context): List<List<MusicModel>> {
-        val result = mutableListOf<List<MusicModel>>()
+    /**
+     * Track lists keyed by playlist id. Also reads the legacy format — a positional array of
+     * arrays, where element 0 held the first user playlist — so existing data survives the switch.
+     */
+    private fun loadAllPlaylistTracks(context: Context): Map<Long, List<MusicModel>> {
+        val result = mutableMapOf<Long, List<MusicModel>>()
         val f = File(context.filesDir, PLAYLIST_DATA_FILE)
         if (!f.exists()) return result
         try {
             val json = readFile(f) ?: return result
-            val outer = JSONArray(json)
-            for (i in 0 until outer.length()) {
-                val inner = outer.getJSONArray(i)
-                val list = mutableListOf<MusicModel>()
-                for (j in 0 until inner.length()) {
-                    list.add(musicModelFromJson(inner.getJSONObject(j)))
+            if (json.trimStart().startsWith("[")) {
+                val outer = JSONArray(json)
+                for (i in 0 until outer.length()) {
+                    result[FIRST_USER_PLAYLIST_ID + i] = readTrackArray(outer.getJSONArray(i))
                 }
-                result.add(list)
+            } else {
+                val outer = JSONObject(json)
+                for (key in outer.keys()) {
+                    val id = key.toLongOrNull() ?: continue
+                    result[id] = readTrackArray(outer.getJSONArray(key))
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "loadAllPlaylistTracks error", e)
         }
         return result
+    }
+
+    private fun readTrackArray(arr: JSONArray): List<MusicModel> {
+        val list = mutableListOf<MusicModel>()
+        for (j in 0 until arr.length()) {
+            try {
+                list.add(musicModelFromJson(arr.getJSONObject(j)))
+            } catch (e: Exception) {
+                Log.e(TAG, "readTrackArray parse error", e)
+            }
+        }
+        return list
     }
 
     private fun musicModelToJson(m: MusicModel): JSONObject {
